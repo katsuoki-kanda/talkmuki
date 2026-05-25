@@ -1,0 +1,576 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hybrid Control Talking Aid with Overlay History</title>
+    
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #000;
+            font-family: "Helvetica Neue", Arial, "Hiragino Kaku Gothic ProN", "Hiragino Sans", Meiryo, sans-serif;
+            font-size: 150%; 
+        }
+        #ui-layer {
+            position: absolute;
+            bottom: 5px;
+            right: 15px;
+            z-index: 100;
+            color: white;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 4px 12px;
+            border-radius: 15px;
+            pointer-events: none;
+            font-size: 40%;
+            display: flex;
+            gap: 15px;
+            white-space: nowrap;
+        }
+        canvas#output_canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            object-fit: cover;
+            transform: scaleX(-1);
+            z-index: 1;
+            opacity: 0.5;
+        }
+        video#input_video {
+            display: none;
+        }
+        #talking-aid-container {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            right: 10px;
+            bottom: 30px; 
+            background: rgba(255, 255, 255, 0.2); 
+            border-radius: 10px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            padding: 15px;
+            z-index: 10;
+        }
+        #textarea {
+            width: 100%;
+            height: 120px;
+            font-size: 170%; 
+            border: 2px solid rgba(0, 0, 0, 0.2);
+            border-radius: 8px;
+            padding: 10px 15px;
+            box-sizing: border-box;
+            background: rgba(255, 255, 255, 0.8); 
+            color: black;
+            resize: none;
+            cursor: pointer;
+        }
+        
+        /* 予測変換オーバーレイエリア */
+        #suggestion-overlay {
+            position: absolute;
+            top: 145px; 
+            left: 15px;
+            right: 15px;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            z-index: 20;
+            pointer-events: none;
+        }
+        .suggestion-item {
+            background: rgba(255, 255, 0, 0.95); 
+            color: #000;
+            padding: 8px 15px; 
+            border-radius: 8px;
+            font-weight: bold;
+            font-size: 105%; 
+            border: 3px solid #b7574a;
+            cursor: pointer;
+            pointer-events: auto;
+            box-shadow: 2px 2px 8px rgba(0,0,0,0.3);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            transition: all 0.1s;
+        }
+        .suggestion-cancel {
+            background: #333 !important;
+            color: #fff !important;
+            text-align: center;
+            font-size: 85% !important;
+            padding: 6px !important;
+            margin-bottom: 2px;
+            border-color: #555 !important;
+        }
+
+        #keyboard-grid {
+            display: grid;
+            grid-template-columns: repeat(11, 1fr);
+            grid-template-rows: repeat(6, 1fr);
+            gap: 8px;
+            flex: 1;
+        }
+        .key {
+            background: rgba(255, 255, 255, 0.7); 
+            border: 3px solid transparent;
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 140%;
+            font-weight: bold;
+            color: #000;
+            box-sizing: border-box;
+            transition: all 0.1s;
+        }
+        /* スキャン・グリッド選択中のハイライト（50音表用） */
+        .key.active {
+            border-color: #ff0000;
+            background: #fffb00;
+            transform: scale(1.05);
+            z-index: 20;
+            box-shadow: 0 0 15px rgba(255, 0, 0, 0.8);
+        }
+        /* 予測変換アイテムが選択された時のハイライト（水色仕様） */
+        .suggestion-item.active {
+            background: #00d2ff !important; 
+            color: #000000 !important;
+            border-color: #ff0000 !important; 
+            transform: scale(1.02);
+            box-shadow: 0 0 18px rgba(0, 210, 255, 0.9);
+            z-index: 30;
+        }
+        .key-special {
+            background: rgba(253, 246, 242, 0.8);
+            color: #b7574a;
+            font-size: 90%;
+        }
+        .stopped {
+            opacity: 0.5;
+            filter: grayscale(1);
+        }
+    </style>
+</head>
+<body>
+
+    <div id="ui-layer">
+        <div id="status">システム起動中...</div>
+        <div id="mode-display">モード: ハイブリッド（表情＆顔向き）操作</div>
+    </div>
+
+    <video id="input_video"></video>
+    <canvas id="output_canvas"></canvas>
+
+    <div id="talking-aid-container">
+        <textarea id="textarea" readonly placeholder="入力待ち"></textarea>
+        
+        <div id="suggestion-overlay"></div>
+
+        <div id="keyboard-grid">
+            <div class="key key-special">話す</div>
+            <div class="key">あ</div> <div class="key">か</div> <div class="key">さ</div> <div class="key">た</div> <div class="key">な</div> <div class="key">は</div> <div class="key">ま</div> <div class="key">や</div> <div class="key">ら</div> <div class="key">わ</div>
+            
+            <div class="key key-special">一字消</div>
+            <div class="key">い</div> <div class="key">き</div> <div class="key">し</div> <div class="key">ち</div> <div class="key">に</div> <div class="key">ひ</div> <div class="key">み</div> <div class="key">、</div> <div class="key">り</div> <div class="key">を</div>
+            
+            <div class="key key-special">全消去</div>
+            <div class="key">う</div> <div class="key">く</div> <div class="key">す</div> <div class="key">つ</div> <div class="key">ぬ</div> <div class="key">ふ</div> <div class="key">む</div> <div class="key">ゆ</div> <div class="key">る</div> <div class="key">ん</div>
+            
+            <div class="key key-special">゛</div>
+            <div class="key">え</div> <div class="key">け</div> <div class="key">せ</div> <div class="key">て</div> <div class="key">ね</div> <div class="key">へ</div> <div class="key">め</div> <div class="key">。</div> <div class="key">れ</div> <div class="key key-special">空白</div>
+            
+            <div class="key key-special">゜</div>
+            <div class="key">お</div> <div class="key">こ</div> <div class="key">そ</div> <div class="key">と</div> <div class="key">の</div> <div class="key">ほ</div> <div class="key">も</div> <div class="key">よ</div> <div class="key">ろ</div> <div class="key key-special">小文字</div>
+            
+            <div class="key">1</div> <div class="key">2</div> <div class="key">3</div> <div class="key">4</div> <div class="key">5</div> <div class="key">6</div> <div class="key">7</div> <div class="key">8</div> <div class="key">9</div> <div class="key">0</div> <div class="key key-special">リセット</div>
+        </div>
+    </div>
+
+<script>
+const videoElement = document.getElementById('input_video');
+const canvasElement = document.getElementById('output_canvas');
+const canvasCtx = canvasElement.getContext('2d');
+const statusDiv = document.getElementById('status');
+const textarea = document.getElementById('textarea');
+const suggestionOverlay = document.getElementById('suggestion-overlay');
+const keys = document.querySelectorAll('.key');
+
+const COL_COUNT = 11;
+const ROW_COUNT = 6;
+
+// 【重要修正】スキャン移動していく時間（クールダウン）をこれまでの1.3倍（550ms -> 715ms）に設定
+const ACTION_COOL_DOWN = 715; 
+
+let lastActionTime = 0;
+let isCalibrated = false;
+let isInitialRun = true; 
+let isWaitingToCalibrate = false; 
+let isRunning = true;
+let calibrationData = {};
+
+// グリッド位置管理
+let currentRow = 0;
+let currentCol = 0;
+
+// 予測変換・履歴管理
+const HISTORY_KEY = 'talking_aid_history';
+let phraseHistory = JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]");
+let activeSuggestionIndex = -1; // -1は通常キーボード、0以上は履歴候補を選択中
+
+const dakutenMap = {'か':'が','き':'ぎ','く':'ぐ','け':'げ','こ':'ご','さ':'ざ','し':'じ','す':'ず','せ':'ぜ','そ':'ぞ','た':'だ','ち':'ぢ','つ':'づ','て':'で','と':'ど','は':'ば','ひ':'び','ふ':'ぶ','へ':'べ','ほ':'ぼ','が':'か','ぎ':'き','ぐ':'く','げ':'け','ご':'こ','ざ':'さ','じ':'し','ず':'す','ぜ':'ぜ','ぞ':'そ','だ':'た','ぢ':'ち','づ':'つ','て':'て','ど':'と','ば':'は','び':'ひ','ぶ':'ふ','べ':'へ','ぼ':'ほ'};
+const handakutenMap = {'は':'ぱ','ひ':'ぴ','ふ':'ぷ','へ':'ぺ','ほ':'ぼ','ば':'ぱ','び':'ぴ','ぶ':'ぷ','べ':'ぺ','ぼ':'ほ','ぱ':'は','ぴ':'ひ','ぷ':'ふ','ぺ':'へ','ぽ':'ほ'};
+const smallMap = {'あ':'ぁ','い':'ぃ','う':'ぅ','え':'ぇ','お':'ぉ','つ':'っ','や':'ゃ','ゆ':'ゅ','よ':'よ','わ':'ゎ','ぁ':'あ','ぃ':'い','ぅ':'う','ぇ':'え','ぉ':'お','っ':'つ','ゃ':'や','ゅ':'ゆ','ょ':'よ','ゎ':'わ'};
+
+function speak(text) {
+    if(!text) return;
+    const uttr = new SpeechSynthesisUtterance(text);
+    uttr.lang = 'ja-JP';
+    window.speechSynthesis.speak(uttr);
+}
+
+function beep(freq = 800, duration = 50) {
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const oscillator = audioCtx.createOscillator();
+    oscillator.type = 'sine';
+    oscillator.frequency.setValueAtTime(freq, audioCtx.currentTime);
+    oscillator.connect(audioCtx.destination);
+    oscillator.start();
+    oscillator.stop(audioCtx.currentTime + duration / 1000);
+}
+
+function startCalibrationDelay() {
+    isCalibrated = false;
+    isWaitingToCalibrate = true;
+    statusDiv.innerText = "2秒後に登録します...";
+    speak("正面を向いて。2秒後に登録します。");
+    setTimeout(() => {
+        isWaitingToCalibrate = false;
+    }, 2000);
+}
+
+// 履歴の保存
+function saveToHistory(text) {
+    if(!text || text.trim().length === 0) return;
+    phraseHistory = phraseHistory.filter(item => item !== text); 
+    phraseHistory.unshift(text); 
+    if(phraseHistory.length > 100) phraseHistory.pop(); 
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(phraseHistory));
+}
+
+// 予測変換ポップアップの更新
+function updateSuggestions() {
+    const input = textarea.value;
+    suggestionOverlay.innerHTML = '';
+    activeSuggestionIndex = -1; // 候補表示が新しくなったらインデックスを初期化
+    
+    if (input.length === 0) return;
+
+    const matches = phraseHistory
+        .filter(phrase => phrase.startsWith(input) && phrase !== input)
+        .slice(0, 5);
+
+    if (matches.length > 0) {
+        // 1. キャンセルボタン
+        const cancelBtn = document.createElement('div');
+        cancelBtn.className = 'suggestion-item suggestion-cancel';
+        cancelBtn.innerText = '× 予測を閉じて 50音表を使う';
+        cancelBtn.addEventListener('click', () => {
+            suggestionOverlay.innerHTML = ''; 
+            activeSuggestionIndex = -1;
+            updateHighlight();
+        });
+        suggestionOverlay.appendChild(cancelBtn);
+
+        // 2. 履歴候補
+        matches.forEach(match => {
+            const div = document.createElement('div');
+            div.className = 'suggestion-item';
+            div.innerText = match;
+            div.addEventListener('click', () => {
+                textarea.value = match;
+                saveToHistory(match); 
+                speak(match);
+                suggestionOverlay.innerHTML = ''; 
+                activeSuggestionIndex = -1;
+                updateHighlight();
+            });
+            suggestionOverlay.appendChild(div);
+        });
+    }
+}
+
+function updateHighlight() {
+    // すべてのハイライトをクリア
+    keys.forEach(k => k.classList.remove('active'));
+    const sugItems = document.querySelectorAll('.suggestion-item');
+    sugItems.forEach(item => item.classList.remove('active'));
+
+    // 予測変換エリア選択中の場合
+    if (activeSuggestionIndex >= 0 && sugItems.length > 0) {
+        if (activeSuggestionIndex >= sugItems.length) {
+            activeSuggestionIndex = sugItems.length - 1;
+        }
+        sugItems[activeSuggestionIndex].classList.add('active');
+    } else {
+        // 通常キーボード選択中の場合
+        const index = currentRow * COL_COUNT + currentCol;
+        if (keys[index]) {
+            keys[index].classList.add('active');
+        }
+    }
+    
+    const container = document.getElementById('talking-aid-container');
+    if (isRunning) {
+        container.classList.remove('stopped');
+    } else {
+        container.classList.add('stopped');
+    }
+}
+
+function onResults(results) {
+    canvasCtx.save();
+    canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+    canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+
+    if (results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0) {
+        const landmarks = results.multiFaceLandmarks[0];
+        
+        if (!isCalibrated) {
+            if (isInitialRun) {
+                isInitialRun = false;
+                startCalibrationDelay();
+                canvasCtx.restore();
+                return;
+            }
+            if (isWaitingToCalibrate) {
+                statusDiv.innerText = "準備中... 表情を戻して正面を向いて";
+                canvasCtx.restore();
+                return;
+            }
+
+            statusDiv.innerText = "正面を向いて登録中...";
+            calibrationData = {
+                faceH: landmarks[152].y - landmarks[10].y,
+                faceW: landmarks[454].x - landmarks[234].x,
+                upperFaceH: landmarks[5].y - landmarks[10].y,
+                lowerFaceH: landmarks[152].y - landmarks[5].y,
+                eyebrowDist: ((landmarks[159].y - landmarks[105].y) + (landmarks[386].y - landmarks[334].y)) / 2,
+                mouthOpen: landmarks[16].y - landmarks[11].y,
+                mouthW: landmarks[409].x - landmarks[185].x, 
+                leftCornerDist: landmarks[270].y - landmarks[203].y,
+                rightCornerDist: landmarks[40].y - landmarks[423].y,
+                puckerWidth: landmarks[270].x - landmarks[40].x
+            };
+            isCalibrated = true;
+            speak("準備できました。");
+            updateHighlight();
+            canvasCtx.restore();
+            return;
+        }
+
+        const now = performance.now();
+        const currentFaceH = landmarks[152].y - landmarks[10].y;
+        const currentFaceW = landmarks[454].x - landmarks[234].x;
+        const hirituY = currentFaceH / calibrationData.faceH;
+        const hirituX = currentFaceW / calibrationData.faceW;
+
+        // 顔の上下向き計算比率
+        const mouthHH = (calibrationData.upperFaceH / calibrationData.lowerFaceH) / 
+                        ((landmarks[5].y - landmarks[10].y) / (landmarks[152].y - landmarks[5].y));
+
+        if (now - lastActionTime > ACTION_COOL_DOWN) {
+            let moved = false;
+            const sugItems = document.querySelectorAll('.suggestion-item');
+
+            // 現在の口の状態を取得
+            const currentMouthOpen = landmarks[16].y - landmarks[11].y;
+            const currentMouthWidth = landmarks[409].x - landmarks[185].x;
+
+            // 口が大きく開いているかのフラグ（基準値の2.3倍）
+            // かつ「口の横幅が通常時の85%以上」を維持している時のみ、正しい口開け判定とみなす
+            const isActualMouthOpening = (currentMouthOpen > calibrationData.mouthOpen * 2.3 * hirituY) && 
+                                         (currentMouthWidth > calibrationData.mouthW * 0.85 * hirituX);
+
+            // --- 1. 上移動 (眉挙げ OR 顔を上に向ける) ---
+            const currentEyebrowL = landmarks[159].y - landmarks[105].y;
+            const currentEyebrowR = landmarks[386].y - landmarks[334].y;
+            const isEyebrowUp = (currentEyebrowL > calibrationData.eyebrowDist * 1.35 * hirituY) || (currentEyebrowR > calibrationData.eyebrowDist * 1.35 * hirituY);
+            
+            // 口が開いている時は顔向きによる上暴発を防ぐため「!isActualMouthOpening」の時のみ顔向き上移動を許可
+            const isFaceUp = (mouthHH > 1.13) && !isActualMouthOpening;
+
+            if (isEyebrowUp || isFaceUp) {
+                if (sugItems.length > 0) {
+                    // 入力候補が表示されている時は候補内を上にループ移動
+                    if (activeSuggestionIndex === -1) {
+                        activeSuggestionIndex = sugItems.length - 1; // 一番下の候補へ
+                    } else {
+                        activeSuggestionIndex--;
+                    }
+                } else {
+                    // 通常時はキーボードを上移動
+                    currentRow = (currentRow - 1 + ROW_COUNT) % ROW_COUNT;
+                }
+                moved = true;
+            }
+            // --- 2. 下移動 (口を開ける[横幅キープ] OR 顔を下に向ける) ---
+            else {
+                // 口が開いている時は顔向き下判定をスキップし、純粋な口開け判定のみを適用（干渉防止）
+                const isFaceDown = (mouthHH < 0.87) && !isActualMouthOpening;
+
+                if (isActualMouthOpening || isFaceDown) {
+                    if (sugItems.length > 0) {
+                        // 入力候補が表示されている時は候補内を下にループ移動
+                        activeSuggestionIndex++;
+                        if (activeSuggestionIndex >= sugItems.length) {
+                            activeSuggestionIndex = -1; // 候補の選択を抜けてキーボードに戻る
+                            currentRow = 0;
+                        }
+                    } else {
+                        // 通常時はキーボードを下移動
+                        currentRow = (currentRow + 1) % ROW_COUNT;
+                    }
+                    moved = true;
+                }
+            }
+
+            // --- 3. 左移動 (左口角上げ OR 顔を左に向ける) ---
+            const currentLeftCorner = landmarks[270].y - landmarks[203].y;
+            const isLeftCornerUp = (currentLeftCorner < calibrationData.leftCornerDist * 0.8 * hirituY);
+            const isFaceLeft = ((landmarks[454].x - landmarks[5].x) < (calibrationData.faceW * 0.39 * hirituX));
+
+            if (!moved && (isLeftCornerUp || isFaceLeft)) {
+                if (activeSuggestionIndex >= 0) {
+                    activeSuggestionIndex = -1; 
+                } else {
+                    currentCol = (currentCol - 1 + COL_COUNT) % COL_COUNT;
+                }
+                moved = true;
+            }
+
+            // --- 4. 右移動 (右口角上げ OR 顔を右に向ける) ---
+            const currentRightCorner = landmarks[40].y - landmarks[423].y;
+            const isRightCornerUp = (currentRightCorner < calibrationData.rightCornerDist * 0.8 * hirituY);
+            const isFaceRight = ((landmarks[5].x - landmarks[234].x) < (calibrationData.faceW * 0.39 * hirituX));
+
+            if (!moved && (isRightCornerUp || isFaceRight)) {
+                if (activeSuggestionIndex >= 0) {
+                    activeSuggestionIndex = -1;
+                } else {
+                    currentCol = (currentCol + 1) % COL_COUNT;
+                }
+                moved = true;
+            }
+
+            // 移動アクションが実行された場合
+            if (moved) {
+                beep(400, 30);
+                lastActionTime = now;
+                updateHighlight();
+                canvasCtx.restore();
+                return;
+            }
+
+            // --- 5. 口すぼ目で決定 ---
+            const currentPucker = landmarks[270].x - landmarks[40].x;
+            if (currentPucker < calibrationData.puckerWidth * 0.82 * hirituX) {
+                if (activeSuggestionIndex >= 0 && sugItems[activeSuggestionIndex]) {
+                    sugItems[activeSuggestionIndex].click();
+                } else {
+                    const index = currentRow * COL_COUNT + currentCol;
+                    if (keys[index]) {
+                        keys[index].click();
+                    }
+                }
+                beep(300, 30);
+                lastActionTime = now;
+                canvasCtx.restore();
+                return;
+            }
+
+            statusDiv.innerText = "準備完了";
+        }
+    }
+    canvasCtx.restore();
+}
+
+function handleKeyAction(val) {
+    const currentText = textarea.value;
+    const lastChar = currentText.slice(-1);
+
+    if (val === '話す') {
+        saveToHistory(currentText); 
+        speak(currentText);
+        suggestionOverlay.innerHTML = ''; 
+    } else if (val === '一字消') {
+        textarea.value = currentText.slice(0, -1);
+        updateSuggestions(); 
+    } else if (val === '全消去') {
+        textarea.value = '';
+        suggestionOverlay.innerHTML = ''; 
+    } else if (val === '空白') {
+        textarea.value += ' ';
+    } else if (val === '゛') {
+        if (lastChar && dakutenMap[lastChar]) {
+            textarea.value = currentText.slice(0, -1) + dakutenMap[lastChar];
+        }
+    } else if (val === '゜') {
+        if (lastChar && handakutenMap[lastChar]) {
+            textarea.value = currentText.slice(0, -1) + handakutenMap[lastChar];
+        }
+    } else if (val === '小文字') {
+        if (lastChar && smallMap[lastChar]) {
+            textarea.value = currentText.slice(0, -1) + smallMap[lastChar];
+        }
+    } else if (val === 'リセット') {
+        textarea.value = '';
+        suggestionOverlay.innerHTML = '';
+        startCalibrationDelay(); 
+    } else if (val.length === 1) {
+        textarea.value += val;
+        updateSuggestions(); 
+    }
+    textarea.scrollTop = textarea.scrollHeight;
+}
+
+// キーボードのクリックイベント登録
+keys.forEach(key => {
+    key.addEventListener('click', () => handleKeyAction(key.innerText));
+});
+
+// テキストエリア自体のクリック発話対応
+textarea.addEventListener('click', () => {
+    const currentText = textarea.value;
+    if (currentText) {
+        saveToHistory(currentText); 
+        speak(currentText);         
+        suggestionOverlay.innerHTML = ''; 
+    }
+});
+
+const faceMesh = new FaceMesh({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`});
+faceMesh.setOptions({ maxNumFaces: 1, refineLandmarks: true, minDetectionConfidence: 0.6, minTrackingConfidence: 0.6 });
+faceMesh.onResults(onResults);
+
+const camera = new Camera(videoElement, {
+    onFrame: async () => {
+        canvasElement.width = window.innerWidth;
+        canvasElement.height = window.innerHeight;
+        await faceMesh.send({image: videoElement});
+    },
+    width: 1280, height: 720
+});
+camera.start();
+
+</script>
+</body>
+</html>
